@@ -15,20 +15,20 @@
 package update
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"sync"
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/golang/glog"
+	"github.com/transparency-dev/armored-witness-applet/api"
 	"github.com/transparency-dev/formats/log"
 )
 
 type LogClient interface {
 	GetLeafAndInclusion(index, treeSize uint64) ([]byte, [][]byte, error)
+	GetBinary(release api.FirmwareRelease) ([]byte, error)
 }
 
 func NewHttpFetcher(client LogClient) *HttpFetcher {
@@ -55,21 +55,50 @@ func (f *HttpFetcher) GetLatestVersions() (os semver.Version, applet semver.Vers
 	if f.latestOS == nil || f.latestApplet == nil {
 		return semver.Version{}, semver.Version{}, errors.New("no versions of OS or applet found in log")
 	}
-	return f.latestOS.version, f.latestApplet.version, nil
+	return f.latestOS.manifest.GitTagName, f.latestApplet.manifest.GitTagName, nil
 }
 
 func (f *HttpFetcher) GetOS() ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.latestOS == nil {
-		return []byte{}, errors.New("no latest OS available")
+		return nil, errors.New("no latest OS available")
 	}
-	return f.latestOS.data, nil
+	if f.latestOS.binary == nil {
+		binary, err := f.client.GetBinary(f.latestOS.manifest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get binary: %v", err)
+		}
+		f.latestOS.binary = binary
+	}
+	return f.latestOS.binary, nil
 }
 
 func (f *HttpFetcher) GetApplet() ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.latestApplet == nil {
-		return []byte{}, errors.New("no latest applet available")
+		return nil, errors.New("no latest applet available")
 	}
-	return f.latestApplet.data, nil
+	if f.latestApplet.binary == nil {
+		binary, err := f.client.GetBinary(f.latestApplet.manifest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get binary: %v", err)
+		}
+		f.latestApplet.binary = binary
+	}
+	return f.latestApplet.binary, nil
+}
+
+// Notify should be called when a new checkpoint is available.
+// This triggers a scan of the new entries in the log to find new firmware.
+// TODO(mhutchinson): replace this with a channel?
+func (f *HttpFetcher) Notify(cp log.Checkpoint) {
+	if err := f.scanTo(cp); err != nil {
+		glog.Warningf("failed to scan to latest checkpoint: %v", err)
+	}
 }
 
 func (f *HttpFetcher) scanTo(to log.Checkpoint) error {
@@ -86,64 +115,43 @@ func (f *HttpFetcher) scanTo(to log.Checkpoint) error {
 		if err != nil {
 			return fmt.Errorf("failed to get log leaf %d: %v", i, err)
 		}
-		target, version, data, err := parseLeaf(leaf)
+		manifest, err := parseLeaf(leaf)
 		if err != nil {
 			return fmt.Errorf("failed to parse leaf at %d: %v", i, err)
 		}
-		switch target {
-		case "trusted_os":
-			if f.latestOS == nil || f.latestOS.version.LessThan(version) {
+		switch manifest.Component {
+		case api.ComponentOS:
+			if f.latestOS == nil || f.latestOS.manifest.GitTagName.LessThan(manifest.GitTagName) {
 				f.latestOS = &firmwareRelease{
 					logIndex: i,
-					version:  version,
-					data:     data,
+					manifest: manifest,
 				}
 			}
-		case "trusted_applet":
-			if f.latestApplet == nil || f.latestApplet.version.LessThan(version) {
+		case api.ComponentApplet:
+			if f.latestApplet == nil || f.latestApplet.manifest.GitTagName.LessThan(manifest.GitTagName) {
 				f.latestApplet = &firmwareRelease{
 					logIndex: i,
-					version:  version,
-					data:     data,
+					manifest: manifest,
 				}
 			}
 		default:
-			glog.Warningf("unknown build in log: %q", target)
+			glog.Warningf("unknown build in log: %q", manifest.Component)
 		}
 	}
 	f.latest = to
 	return nil
 }
 
-func parseLeaf(leaf []byte) (string, semver.Version, []byte, error) {
-	panic("not implemented")
+func parseLeaf(leaf []byte) (api.FirmwareRelease, error) {
+	r := api.FirmwareRelease{}
+	if err := json.Unmarshal(leaf, &r); err != nil {
+		return r, fmt.Errorf("Unmarshal: %v", err)
+	}
+	return r, nil
 }
 
 type firmwareRelease struct {
 	logIndex uint64
-	version  semver.Version
-	data     []byte
-}
-
-type HttpLogClient struct {
-	logAddress url.URL
-	client     http.Client
-}
-
-func (f *HttpLogClient) GetLeafAndInclusion(index, treeSize uint64) ([]byte, [][]byte, error) {
-	// TODO(mhutchinson): determine real URL
-	leafAddr := f.logAddress.JoinPath(fmt.Sprintf("/TODO/v1/%d", index))
-	resp, err := f.client.Get(leafAddr.String())
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get firmware at %q: %v", leafAddr, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("got non-OK error code from %q: %d", leafAddr, resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read body: %v", err)
-	}
-	// TODO(mhutchinson): get an inclusion proof
-	return body, nil, nil
+	manifest api.FirmwareRelease
+	binary   []byte
 }
